@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ESP32-S3 Debug (OpenOCD + GDB)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/my_project.elf",
+      "miDebuggerPath": "C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gdb.exe",
+      "miDebuggerServerAddress": "localhost:3333",
+      "setupCommands": [
+        { "description": "Halt the CPU", "text": "monitor reset halt", "ignoreFailures": false },
+        { "description": "Break at app_main", "text": "thb app_main",    "ignoreFailures": false },
+        { "description": "Run to breakpoint",  "text": "continue",        "ignoreFailures": false }
+      ],
+      "MIMode": "gdb",
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "stopAtEntry": false
+    }
+  ]
+}
