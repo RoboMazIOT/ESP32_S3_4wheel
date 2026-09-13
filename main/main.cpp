@@ -99,7 +99,9 @@ enum class LedMode : uint8_t {
 };
 
 static LedMode  g_ledMode        = LedMode::DISCONNECTED;
-static bool     g_ledManualHold  = false;   // CMD:LED manual override
+static bool     g_ledManualHold  = false;   // CMD:LED manual override active
+static uint32_t g_ledManualStart = 0;       // timestamp when manual override started
+static uint32_t g_ledManualDurMs = 0;       // how long to hold manual color (ms)
 static uint8_t  g_ledColorIndex  = 0;
 static uint32_t g_ledLastCycleMs = 0;
 static uint32_t g_ledConnectMs   = 0;       // timestamp of BLE connect
@@ -111,6 +113,8 @@ static constexpr uint32_t LED_BURST_INTERVAL_MS  = 200;   // fast cycle period
 static constexpr uint32_t LED_IDLE_INTERVAL_MS   = 1000;  // slow cycle period
 static constexpr uint32_t LED_DISCONNECT_BLINK_MS = 500;  // red blink half-period (1 s total)
 static constexpr uint32_t LED_MOVING_BLINK_MS    = 500;   // green blink half-period while moving
+static constexpr uint32_t LED_MANUAL_OFF_MS      = 2000;  // hold "off" for 2 s then resume
+static constexpr uint32_t LED_MANUAL_COLOR_MS    = 5000;  // hold selected color for 5 s then resume
 
 struct RGBColor { uint8_t r, g, b; const char* name; };
 static constexpr RGBColor COLOR_CYCLE[] = {
@@ -161,7 +165,15 @@ static void rgbOff()
 // Non-blocking RGB LED state machine — called from control_task
 static void updateLed()
 {
-    if (g_ledManualHold) return;  // CMD:LED manual override active
+    // CMD:LED manual override — hold for timed duration, then auto-release
+    if (g_ledManualHold) {
+        if (millis() - g_ledManualStart >= g_ledManualDurMs) {
+            g_ledManualHold  = false;
+            g_ledMode        = LedMode::IDLE_CYCLE;
+            g_ledLastCycleMs = millis();
+        }
+        return;
+    }
 
     uint32_t now = millis();
 
@@ -360,7 +372,11 @@ static bool handleBtCommand(const ParsedCommand& cmd)
         uint8_t r = (uint8_t)atoi(cmd.params[0]);
         uint8_t g = (uint8_t)atoi(cmd.params[1]);
         uint8_t b = (uint8_t)atoi(cmd.params[2]);
-        g_ledManualHold = true;
+        g_ledManualHold  = true;
+        g_ledManualStart = millis();
+        // RGB off (0,0,0) → hold 2 s, any color → hold 5 s, then resume normal
+        g_ledManualDurMs = (r == 0 && g == 0 && b == 0)
+                           ? LED_MANUAL_OFF_MS : LED_MANUAL_COLOR_MS;
         setRGB(r, g, b);
         bt.sendAck("LED");
         return true;
