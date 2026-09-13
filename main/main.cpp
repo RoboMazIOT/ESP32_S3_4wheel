@@ -87,12 +87,28 @@ static float      g_defaultSpeed = 70.0f;
 // BT connection flag — written by control_task, read by sensor_task
 static std::atomic<bool> g_btConnected{false};
 
-// RGB LED state (control_task only — no mutex needed)
-static bool     g_ledAutoCycle   = false;
-static bool     g_ledManualHold  = false;
+// ── RGB LED state machine (control_task only — no mutex needed) ──
+//
+//  LED_DISCONNECTED — solid red
+//  LED_CONNECT_BURST — first 3 s after BLE connect, fast color cycle 200 ms
+//  LED_IDLE_CYCLE   — after burst, slow color cycle 1000 ms
+//  LED_DATA_BLINK   — on received command, blink green 300 ms then → IDLE
+//
+enum class LedMode : uint8_t {
+    DISCONNECTED, CONNECT_BURST, IDLE_CYCLE, DATA_BLINK
+};
+
+static LedMode  g_ledMode        = LedMode::DISCONNECTED;
+static bool     g_ledManualHold  = false;   // CMD:LED manual override
 static uint8_t  g_ledColorIndex  = 0;
 static uint32_t g_ledLastCycleMs = 0;
-static constexpr uint32_t LED_CYCLE_INTERVAL_MS = 100;
+static uint32_t g_ledConnectMs   = 0;       // timestamp of BLE connect
+static uint32_t g_ledBlinkStart  = 0;       // timestamp of data-blink start
+
+static constexpr uint32_t LED_BURST_DURATION_MS  = 3000;  // fast cycle duration
+static constexpr uint32_t LED_BURST_INTERVAL_MS  = 200;   // fast cycle period
+static constexpr uint32_t LED_IDLE_INTERVAL_MS   = 1000;  // slow cycle period
+static constexpr uint32_t LED_DATA_BLINK_MS      = 300;   // green blink duration
 
 struct RGBColor { uint8_t r, g, b; const char* name; };
 static constexpr RGBColor COLOR_CYCLE[] = {
@@ -105,6 +121,10 @@ static constexpr RGBColor COLOR_CYCLE[] = {
     {255, 255, 255, "White"},
 };
 static constexpr uint8_t COLOR_COUNT = sizeof(COLOR_CYCLE) / sizeof(COLOR_CYCLE[0]);
+
+// ── LCD connection state ─────────────────────────────────────────
+static uint32_t g_lcdConnectMs    = 0;       // timestamp of BLE connect
+static constexpr uint32_t LCD_CONNECTED_SHOW_MS = 3000;  // show "Connected" duration
 
 // ── Task handles ─────────────────────────────────────────────────
 // Stored globally so any module can suspend/resume/delete a task or query its
@@ -136,18 +156,65 @@ static void rgbOff()
     }
 }
 
-// Non-blocking RGB LED cycle — called from control_task
-static void updateLedCycle()
+// Non-blocking RGB LED state machine — called from control_task
+static void updateLed()
 {
-    if (!g_ledAutoCycle || g_ledManualHold) return;
+    if (g_ledManualHold) return;  // CMD:LED manual override active
 
     uint32_t now = millis();
-    if (now - g_ledLastCycleMs >= LED_CYCLE_INTERVAL_MS) {
-        g_ledLastCycleMs = now;
-        const auto& c = COLOR_CYCLE[g_ledColorIndex];
-        setRGB(c.r, c.g, c.b);
-        g_ledColorIndex = (g_ledColorIndex + 1) % COLOR_COUNT;
+
+    switch (g_ledMode) {
+        case LedMode::DISCONNECTED:
+            setRGB(255, 0, 0);  // solid red
+            break;
+
+        case LedMode::CONNECT_BURST: {
+            // Fast color cycle (200 ms) for first 3 seconds after connect
+            if (now - g_ledConnectMs >= LED_BURST_DURATION_MS) {
+                g_ledMode = LedMode::IDLE_CYCLE;
+                g_ledLastCycleMs = now;
+                break;
+            }
+            if (now - g_ledLastCycleMs >= LED_BURST_INTERVAL_MS) {
+                g_ledLastCycleMs = now;
+                const auto& c = COLOR_CYCLE[g_ledColorIndex];
+                setRGB(c.r, c.g, c.b);
+                g_ledColorIndex = (g_ledColorIndex + 1) % COLOR_COUNT;
+            }
+            break;
+        }
+
+        case LedMode::IDLE_CYCLE: {
+            // Slow color cycle (1000 ms)
+            if (now - g_ledLastCycleMs >= LED_IDLE_INTERVAL_MS) {
+                g_ledLastCycleMs = now;
+                const auto& c = COLOR_CYCLE[g_ledColorIndex];
+                setRGB(c.r, c.g, c.b);
+                g_ledColorIndex = (g_ledColorIndex + 1) % COLOR_COUNT;
+            }
+            break;
+        }
+
+        case LedMode::DATA_BLINK: {
+            // Green blink for 300 ms, then back to idle cycle
+            if (now - g_ledBlinkStart >= LED_DATA_BLINK_MS) {
+                g_ledMode = LedMode::IDLE_CYCLE;
+                g_ledLastCycleMs = now;
+            } else {
+                setRGB(0, 255, 0);  // solid green during blink
+            }
+            break;
+        }
     }
+}
+
+// Trigger a green data-blink (called when command received from PcPanel)
+static void triggerDataBlink()
+{
+    if (g_ledManualHold) return;
+    g_ledMode       = LedMode::DATA_BLINK;
+    g_ledBlinkStart = millis();
+    setRGB(0, 255, 0);
 }
 
 // ── LCD formatted row ────────────────────────────────────────────
@@ -209,6 +276,9 @@ static float parseSpeed(const char* s)
 static bool handleBtCommand(const ParsedCommand& cmd)
 {
     auto& bt = btCommInstance();
+
+    // Blink green on any received command from PcPanel
+    triggerDataBlink();
 
     auto moveCmd = [&](const char* name, auto fn, MotorState state) -> bool {
         float spd = (cmd.nParams >= 1) ? parseSpeed(cmd.params[0]) : g_defaultSpeed;
@@ -329,7 +399,7 @@ static void handleBtDisconnect()
     ESP_LOGW(TAG, "BT disconnect — braking motors, LED red");
     robot.brake();
     g_motorState    = MotorState::BRK;
-    g_ledAutoCycle  = false;
+    g_ledMode       = LedMode::DISCONNECTED;
     g_ledManualHold = false;
     setRGB(255, 0, 0);
     lcdRow(1, "BT Disconnected");
@@ -357,26 +427,26 @@ static void control_task(void * /*arg*/)
 
         // ── Connection state change ──────────────────────────────
         if (nowConnected && !wasBtConnected) {
-            g_ledAutoCycle   = true;
+            uint32_t now     = millis();
+            g_ledMode        = LedMode::CONNECT_BURST;
             g_ledManualHold  = false;
             g_ledColorIndex  = 0;
-            g_ledLastCycleMs = millis();
+            g_ledLastCycleMs = now;
+            g_ledConnectMs   = now;
+            g_lcdConnectMs   = now;
             g_motorState     = MotorState::IDLE;
             g_btConnected.store(true, std::memory_order_release);
-            lcdRow(1, "BT: Connected!");
-            ESP_LOGI(TAG, "BT connected — LED cycling started");
+            lcdRow(0, "  BT Connected!");
+            lcdRow(1, "");
+            ESP_LOGI(TAG, "BT connected — LED burst started");
         }
         else if (!nowConnected && wasBtConnected) {
             g_btConnected.store(false, std::memory_order_release);
         }
         wasBtConnected = nowConnected;
 
-        // ── LED ──────────────────────────────────────────────────
-        if (nowConnected) {
-            updateLedCycle();
-        } else {
-            setRGB(255, 0, 0);  // solid red = disconnected
-        }
+        // ── LED state machine ────────────────────────────────────
+        updateLed();
 
         vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz
     }
@@ -404,8 +474,14 @@ static void sensor_task(void * /*arg*/)
         float pitch = 0.0f, roll = 0.0f;
         imu.readAngles(pitch, roll);
 
-        // Update LCD only when BT is NOT connected
+        // Update LCD:
+        //   BT off  → show heading + pitch/roll
+        //   BT on, first 3 s → "Connected" banner (written by control_task)
+        //   BT on, after 3 s → show heading + pitch/roll
         if (!btOn) {
+            lcdRow(0, "Hdg:%5.1f %s", heading, compassDir(heading));
+            lcdRow(1, "P:%4d  R:%4d", (int)pitch, (int)roll);
+        } else if (millis() - g_lcdConnectMs >= LCD_CONNECTED_SHOW_MS) {
             lcdRow(0, "Hdg:%5.1f %s", heading, compassDir(heading));
             lcdRow(1, "P:%4d  R:%4d", (int)pitch, (int)roll);
         }
@@ -451,7 +527,9 @@ extern "C" void app_main(void)
     lcd.print("  RoboMAZ Ready!");
 
     // ── I2C sensors (share the bus the LCD already created) ──────
-    compass.init(lcd.busHandle());
+    if (compass.init(lcd.busHandle()) != ESP_OK) {
+        ESP_LOGE(TAG, "Compass init FAILED — no HMC5883L or QMC5883L found");
+    }
     imu.init(lcd.busHandle());
 
     // ── Motors ───────────────────────────────────────────────────
@@ -461,12 +539,16 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Hardware init complete.");
 
     // ── NVS init (required by NimBLE for bonding + RF calibration) ─
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    {
+        esp_err_t ret = nvs_flash_init();
+        if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+            ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            ret = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(ret);
+        ESP_LOGI(TAG, "NVS flash initialised OK");
     }
-    ESP_ERROR_CHECK(ret);
 
     // ── BLE init ─────────────────────────────────────────────────
     // NimBLE host task is created internally on core 0
