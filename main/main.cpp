@@ -89,13 +89,13 @@ static std::atomic<bool> g_btConnected{false};
 
 // ── RGB LED state machine (control_task only — no mutex needed) ──
 //
-//  LED_DISCONNECTED — solid red
+//  LED_DISCONNECTED  — blinking red (1 s period: 500 ms on, 500 ms off)
 //  LED_CONNECT_BURST — first 3 s after BLE connect, fast color cycle 200 ms
-//  LED_IDLE_CYCLE   — after burst, slow color cycle 1000 ms
-//  LED_DATA_BLINK   — on received command, blink green 300 ms then → IDLE
+//  LED_IDLE_CYCLE    — after burst, slow color cycle 1000 ms
+//  LED_MOVING        — green while robot is moving (500 ms on/off blink)
 //
 enum class LedMode : uint8_t {
-    DISCONNECTED, CONNECT_BURST, IDLE_CYCLE, DATA_BLINK
+    DISCONNECTED, CONNECT_BURST, IDLE_CYCLE, MOVING
 };
 
 static LedMode  g_ledMode        = LedMode::DISCONNECTED;
@@ -103,12 +103,14 @@ static bool     g_ledManualHold  = false;   // CMD:LED manual override
 static uint8_t  g_ledColorIndex  = 0;
 static uint32_t g_ledLastCycleMs = 0;
 static uint32_t g_ledConnectMs   = 0;       // timestamp of BLE connect
-static uint32_t g_ledBlinkStart  = 0;       // timestamp of data-blink start
+static uint32_t g_ledLastBlinkMs = 0;       // timestamp of last blink toggle
+static bool     g_ledBlinkOn     = true;    // toggle state for blink modes
 
 static constexpr uint32_t LED_BURST_DURATION_MS  = 3000;  // fast cycle duration
 static constexpr uint32_t LED_BURST_INTERVAL_MS  = 200;   // fast cycle period
 static constexpr uint32_t LED_IDLE_INTERVAL_MS   = 1000;  // slow cycle period
-static constexpr uint32_t LED_DATA_BLINK_MS      = 300;   // green blink duration
+static constexpr uint32_t LED_DISCONNECT_BLINK_MS = 500;  // red blink half-period (1 s total)
+static constexpr uint32_t LED_MOVING_BLINK_MS    = 500;   // green blink half-period while moving
 
 struct RGBColor { uint8_t r, g, b; const char* name; };
 static constexpr RGBColor COLOR_CYCLE[] = {
@@ -124,7 +126,7 @@ static constexpr uint8_t COLOR_COUNT = sizeof(COLOR_CYCLE) / sizeof(COLOR_CYCLE[
 
 // ── LCD connection state ─────────────────────────────────────────
 static uint32_t g_lcdConnectMs    = 0;       // timestamp of BLE connect
-static constexpr uint32_t LCD_CONNECTED_SHOW_MS = 3000;  // show "Connected" duration
+static constexpr uint32_t LCD_CONNECTED_SHOW_MS = 2000;  // show "Connected" duration
 
 // ── Task handles ─────────────────────────────────────────────────
 // Stored globally so any module can suspend/resume/delete a task or query its
@@ -164,9 +166,16 @@ static void updateLed()
     uint32_t now = millis();
 
     switch (g_ledMode) {
-        case LedMode::DISCONNECTED:
-            setRGB(255, 0, 0);  // solid red
+        case LedMode::DISCONNECTED: {
+            // Blinking red — 500 ms on, 500 ms off (1 s period)
+            if (now - g_ledLastBlinkMs >= LED_DISCONNECT_BLINK_MS) {
+                g_ledLastBlinkMs = now;
+                g_ledBlinkOn = !g_ledBlinkOn;
+            }
+            if (g_ledBlinkOn) setRGB(255, 0, 0);
+            else              rgbOff();
             break;
+        }
 
         case LedMode::CONNECT_BURST: {
             // Fast color cycle (200 ms) for first 3 seconds after connect
@@ -195,26 +204,37 @@ static void updateLed()
             break;
         }
 
-        case LedMode::DATA_BLINK: {
-            // Green blink for 300 ms, then back to idle cycle
-            if (now - g_ledBlinkStart >= LED_DATA_BLINK_MS) {
-                g_ledMode = LedMode::IDLE_CYCLE;
-                g_ledLastCycleMs = now;
-            } else {
-                setRGB(0, 255, 0);  // solid green during blink
+        case LedMode::MOVING: {
+            // Blinking green — 500 ms on, 500 ms off while robot is moving
+            if (now - g_ledLastBlinkMs >= LED_MOVING_BLINK_MS) {
+                g_ledLastBlinkMs = now;
+                g_ledBlinkOn = !g_ledBlinkOn;
             }
+            if (g_ledBlinkOn) setRGB(0, 255, 0);
+            else              rgbOff();
             break;
         }
     }
 }
 
-// Trigger a green data-blink (called when command received from PcPanel)
-static void triggerDataBlink()
+// Enter MOVING LED mode — green blink while robot moves (motor commands only)
+static void triggerMovingLed()
 {
     if (g_ledManualHold) return;
-    g_ledMode       = LedMode::DATA_BLINK;
-    g_ledBlinkStart = millis();
+    g_ledMode        = LedMode::MOVING;
+    g_ledLastBlinkMs = millis();
+    g_ledBlinkOn     = true;
     setRGB(0, 255, 0);
+}
+
+// Return to idle cycle when motors stop (BRK / CST / STOP)
+static void triggerIdleLed()
+{
+    if (g_ledManualHold) return;
+    if (g_ledMode == LedMode::MOVING) {
+        g_ledMode        = LedMode::IDLE_CYCLE;
+        g_ledLastCycleMs = millis();
+    }
 }
 
 // ── LCD formatted row ────────────────────────────────────────────
@@ -277,13 +297,11 @@ static bool handleBtCommand(const ParsedCommand& cmd)
 {
     auto& bt = btCommInstance();
 
-    // Blink green on any received command from PcPanel
-    triggerDataBlink();
-
     auto moveCmd = [&](const char* name, auto fn, MotorState state) -> bool {
         float spd = (cmd.nParams >= 1) ? parseSpeed(cmd.params[0]) : g_defaultSpeed;
         (robot.*fn)(spd);
         g_motorState = state;
+        triggerMovingLed();  // green blink while robot is moving
         bt.sendAck(name);
         return true;
     };
@@ -317,12 +335,14 @@ static bool handleBtCommand(const ParsedCommand& cmd)
     if (strcmp(cmd.cmd, "BRK") == 0 || strcmp(cmd.cmd, "STOP") == 0) {
         robot.brake();
         g_motorState = MotorState::BRK;
+        triggerIdleLed();  // motors stopped — back to color cycle
         bt.sendAck("BRK");
         return true;
     }
     if (strcmp(cmd.cmd, "CST") == 0) {
         robot.coast();
         g_motorState = MotorState::CST;
+        triggerIdleLed();  // motors stopped — back to color cycle
         bt.sendAck("CST");
         return true;
     }
@@ -396,11 +416,13 @@ static bool handleBtCommand(const ParsedCommand& cmd)
 // ================================================================
 static void handleBtDisconnect()
 {
-    ESP_LOGW(TAG, "BT disconnect — braking motors, LED red");
+    ESP_LOGW(TAG, "BT disconnect — braking motors, LED blinking red");
     robot.brake();
-    g_motorState    = MotorState::BRK;
-    g_ledMode       = LedMode::DISCONNECTED;
-    g_ledManualHold = false;
+    g_motorState     = MotorState::BRK;
+    g_ledMode        = LedMode::DISCONNECTED;
+    g_ledManualHold  = false;
+    g_ledLastBlinkMs = millis();
+    g_ledBlinkOn     = true;
     setRGB(255, 0, 0);
     lcdRow(1, "BT Disconnected");
 }
@@ -515,7 +537,7 @@ extern "C" void app_main(void)
 
     // ── LED init ─────────────────────────────────────────────────
     init_led();
-    setRGB(255, 0, 0);  // solid red until BLE connects
+    setRGB(255, 0, 0);  // start blinking red until BLE connects
 
     // ── LCD init (SDA=GPIO05, SCL=GPIO06, address=0x27) ─────────
     lcd.init(GPIO_NUM_5, GPIO_NUM_6, 0x27);
