@@ -1,65 +1,58 @@
 // ================================================================
 //  main.cpp
-//  RoboMAZ - Entry point
+//  RoboMAZ - Entry point  (FreeRTOS multi-task architecture)
 //  ESP32-S3 / ESP-IDF  |  C++20
 //
-//  Project folder layout:
+//  Task layout:
+//    app_main()       — one-shot: init hardware, create tasks, vTaskDelete(nullptr)
+//    control_task     — BT polling, LED cycling, connection state  (50 Hz, core 1)
+//    sensor_task      — compass / IMU reads, LCD updates           (10 Hz, core 1)
+//    nimble_host_task — created internally by nimble_port_freertos_init() (core 0)
 //
-//    main/
-//    ├── main.cpp                 ← you are here
-//    ├── CMakeLists.txt
-//    ├── Motor/
-//    │   ├── MecanumRobot.hpp
-//    │   └── MecanumRobot.cpp
-//    ├── PWM/
-//    │   ├── MAZPWM.hpp
-//    │   └── MAZPWM.cpp
-//    ├── LCD/
-//    │   ├── MAZLCD.hpp
-//    │   └── MAZLCD.cpp
-//    ├── Compass/
-//    │   ├── MAZGY271.hpp
-//    │   └── MAZGY271.cpp
-//    └── IMU/
-//        ├── MAZMPU6050.hpp
-//        └── MAZMPU6050.cpp
+//  Stack sizes (bytes — ESP-IDF unit, NOT words):
+//    control  → 8 192 B — BT update + command dispatch + LED refresh
+//    sensor   → 4 096 B — I2C reads (compass + IMU) + LCD writes
 //
-//  CMakeLists.txt SRCS must include:
-//    "Motor/MecanumRobot.cpp"
-//    "PWM/MAZPWM.cpp"
-//    "LCD/MAZLCD.cpp"
-//    "Compass/MAZGY271.cpp"
-//    "IMU/MAZMPU6050.cpp"
+//  Priorities:
+//    control at 5 — BT commands and motor safety are time-critical
+//    sensor  at 3 — sensor polling can tolerate a few ms jitter
+//
+//  Shared state:
+//    g_motorState, g_led*, g_defaultSpeed are written only by
+//    control_task (via BT command callback).
+//    g_btConnected is std::atomic<bool> read by sensor_task to decide
+//    whether it may write the LCD.
 // ================================================================
 
-// Required: ESP-IDF app_main must be declared as C, not C++
 extern "C"
 {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "nvs_flash.h"
 }
 
-#include "Motor/MecanumRobot.hpp"  // pulls in PWM/MAZPWM.hpp transitively
+#include "Motor/MecanumRobot.hpp"
 #include "LCD/MAZLCD.hpp"
 #include "Compass/MAZGY271.hpp"
 #include "IMU/MAZMPU6050.hpp"
+#include "Bluetooth/BluetoothComm.hpp"
 #include "led_strip.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
+#include <atomic>
 
-static const char *TAG = "RoboMAZ";
+[[maybe_unused]] static const char *TAG = "RoboMAZ";
 
 #define BlinkLED_GPIO     GPIO_NUM_46
-#define FullColorLED_GPIO GPIO_NUM_48  // WS2812B — driven via RMT, not plain GPIO
+#define FullColorLED_GPIO GPIO_NUM_48  // WS2812B — driven via RMT
 
-// NOTE: effective speed range is ~70–100 %. Below ~65 % motors stall (dead band — static friction
-// exceeds torque at low duty). Values outside this range compile fine but motors will not move.
-static constexpr float DRIVE_SPEED  = 70.0f;   // straight / strafe speed  [70–100 %]
-static constexpr float ROTATE_SPEED = 70.0f;  // rotation speed           [65–100 %]
+// ── Speed constants ──────────────────────────────────────────────
+[[maybe_unused]] static constexpr float DRIVE_SPEED  = 70.0f;
+[[maybe_unused]] static constexpr float ROTATE_SPEED = 70.0f;
 
 // ── Pin definitions ──────────────────────────────────────────────
 //   Viewed from TOP, front of robot facing UP:
@@ -71,133 +64,93 @@ static constexpr float ROTATE_SPEED = 70.0f;  // rotation speed           [65–
 // Each MotorPins struct maps to one DRV8833 channel:
 //   cw_gpio  → IN1 (clockwise when HIGH)
 //   ccw_gpio → IN2 (counter-clockwise when HIGH)
-static constexpr MotorPins PINS_FRONT_LEFT = {.cw_gpio = 39, .ccw_gpio = 40};
+static constexpr MotorPins PINS_FRONT_LEFT  = {.cw_gpio = 39, .ccw_gpio = 40};
 static constexpr MotorPins PINS_FRONT_RIGHT = {.cw_gpio = 42, .ccw_gpio = 41};
-static constexpr MotorPins PINS_REAR_LEFT = {.cw_gpio = 2, .ccw_gpio = 1};
-static constexpr MotorPins PINS_REAR_RIGHT = {.cw_gpio = 3, .ccw_gpio = 4};
+static constexpr MotorPins PINS_REAR_LEFT   = {.cw_gpio = 2,  .ccw_gpio = 1};
+static constexpr MotorPins PINS_REAR_RIGHT  = {.cw_gpio = 3,  .ccw_gpio = 4};
 
-// ── Global robot instance ────────────────────────────────────────
-// Constructed before app_main; hardware not touched until begin() is called.
+// ── Global instances ─────────────────────────────────────────────
+// Initialised once in app_main before any task is created, so no race on init.
 static MecanumRobot robot(PINS_FRONT_LEFT,
                           PINS_FRONT_RIGHT,
                           PINS_REAR_LEFT,
                           PINS_REAR_RIGHT);
-static MAZLCD    lcd;
+static MAZLCD     lcd;
 static MAZGY271   compass;
 static MAZMPU6050 imu;
 static led_strip_handle_t _rgb_strip = nullptr;
 
+// ── Shared state ─────────────────────────────────────────────────
+static MotorState g_motorState   = MotorState::IDLE;
+static float      g_defaultSpeed = 70.0f;
+
+// BT connection flag — written by control_task, read by sensor_task
+static std::atomic<bool> g_btConnected{false};
+
+// RGB LED state (control_task only — no mutex needed)
+static bool     g_ledAutoCycle   = false;
+static bool     g_ledManualHold  = false;
+static uint8_t  g_ledColorIndex  = 0;
+static uint32_t g_ledLastCycleMs = 0;
+static constexpr uint32_t LED_CYCLE_INTERVAL_MS = 100;
+
 struct RGBColor { uint8_t r, g, b; const char* name; };
 static constexpr RGBColor COLOR_CYCLE[] = {
     {255,   0,   0, "Red"},
-    {255, 165,   0, "Orange"},
-    {255, 255,   0, "Yellow"},
     {  0, 255,   0, "Green"},
-    {  0, 255, 255, "Cyan"},
     {  0,   0, 255, "Blue"},
-    {128,   0, 128, "Purple"},
+    {  0, 255, 255, "Cyan"},
     {255,   0, 255, "Magenta"},
+    {255, 255,   0, "Yellow"},
     {255, 255, 255, "White"},
 };
 static constexpr uint8_t COLOR_COUNT = sizeof(COLOR_CYCLE) / sizeof(COLOR_CYCLE[0]);
 
+// ── Task handles ─────────────────────────────────────────────────
+// Stored globally so any module can suspend/resume/delete a task or query its
+// stack high-water mark at runtime, e.g.:
+//   UBaseType_t hwm = uxTaskGetStackHighWaterMark(h_control);  // bytes free
+static TaskHandle_t h_control = nullptr;
+static TaskHandle_t h_sensor  = nullptr;
+
 // ── Helper ───────────────────────────────────────────────────────
-/**
- * @brief Blocks the calling FreeRTOS task for the given number of
- *        milliseconds using the scheduler tick period.
- *
- * @param ms  Duration to wait in milliseconds
- */
-static void delay_ms(uint32_t ms)
+static uint32_t millis()
 {
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-// ================================================================
-//  app_main
-// ================================================================
-/**
- * @brief ESP-IDF application entry point.
- *
- * Execution order:
- *   1. Startup banner via ESP_LOGI.
- *   2. robot.begin() → initialises bare-metal MCPWM + GPIO routing.
- *   3. 1 s settle delay for power rails.
- *   4. Demo sequence — exercises every movement primitive.
- *   5. Idle loop — yields to FreeRTOS scheduler every second.
- *
- * Must be declared extern "C" so the linker can find it by its
- * unmangled C symbol name.
- */
-static void init_led()
+// ── RGB LED helpers ──────────────────────────────────────────────
+static void setRGB(uint8_t r, uint8_t g, uint8_t b)
 {
-    // GPIO46 — simple green LED
-    gpio_reset_pin(BlinkLED_GPIO);
-    gpio_set_direction(BlinkLED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(BlinkLED_GPIO, 0);
-
-    // GPIO48 — WS2812B RGB LED; needs RMT, not plain GPIO
-    led_strip_config_t strip_cfg = {};
-    strip_cfg.strip_gpio_num        = (int)FullColorLED_GPIO;
-    strip_cfg.max_leds              = 1;
-    strip_cfg.led_model             = LED_MODEL_WS2812;
-    strip_cfg.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
-    led_strip_rmt_config_t rmt_cfg = {};
-    rmt_cfg.resolution_hz = 10 * 1000 * 1000;  // 10 MHz
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &_rgb_strip));
-    led_strip_clear(_rgb_strip);
-}
-void motors_demo()
-{
-     // ── Demo sequence — repeated 4 times ────────────────────────
-    for (int pass = 1; pass <= 1; ++pass) {
-        ESP_LOGI(TAG, "=== Demo pass %d / 4 ===", pass);
-
-        ESP_LOGI(TAG, "--- Forward");
-        robot.moveForward(DRIVE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
-
-        ESP_LOGI(TAG, "--- Backward");
-        robot.moveBackward(DRIVE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
-
-        ESP_LOGI(TAG, "--- Strafe Left");
-        robot.strafeLeft(DRIVE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
-
-        ESP_LOGI(TAG, "--- Strafe Right");
-        robot.strafeRight(DRIVE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
-
-        ESP_LOGI(TAG, "--- Rotate CW");
-        robot.rotateClockwise(ROTATE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
-
-        ESP_LOGI(TAG, "--- Rotate CCW");
-        robot.rotateCounterClockwise(ROTATE_SPEED);
-        delay_ms(500);
-        robot.brake();
-        delay_ms(200);
+    if (_rgb_strip) {
+        led_strip_set_pixel(_rgb_strip, 0, r, g, b);
+        led_strip_refresh(_rgb_strip);
     }
 }
 
-static void mpuDriveRobot(float pitch, float roll);
+[[maybe_unused]]
+static void rgbOff()
+{
+    if (_rgb_strip) {
+        led_strip_clear(_rgb_strip);
+    }
+}
 
-// Writes one formatted line to the LCD.
-//   row  : 0 = top line, 1 = bottom line
-//   fmt  : printf-style format string
-// Automatically pads the line to 16 chars (clears leftover characters)
-// and moves the cursor — no manual setCursor/print needed at call sites.
+// Non-blocking RGB LED cycle — called from control_task
+static void updateLedCycle()
+{
+    if (!g_ledAutoCycle || g_ledManualHold) return;
+
+    uint32_t now = millis();
+    if (now - g_ledLastCycleMs >= LED_CYCLE_INTERVAL_MS) {
+        g_ledLastCycleMs = now;
+        const auto& c = COLOR_CYCLE[g_ledColorIndex];
+        setRGB(c.r, c.g, c.b);
+        g_ledColorIndex = (g_ledColorIndex + 1) % COLOR_COUNT;
+    }
+}
+
+// ── LCD formatted row ────────────────────────────────────────────
 static void lcdRow(uint8_t row, const char* fmt, ...)
 {
     char buf[32];
@@ -214,93 +167,324 @@ static void lcdRow(uint8_t row, const char* fmt, ...)
     lcd.print(buf);
 }
 
-extern "C" void app_main(void)
+// ── LED init ─────────────────────────────────────────────────────
+static void init_led()
 {
-    ESP_LOGI(TAG, "================================");
-    ESP_LOGI(TAG, "   Hello Robo MAZ! Starting up  ");
-    ESP_LOGI(TAG, "================================");
+    // GPIO46 — simple green LED
+    gpio_reset_pin(BlinkLED_GPIO);
+    gpio_set_direction(BlinkLED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(BlinkLED_GPIO, 0);
 
-    // Initialise status LED
-    init_led();
+    // GPIO48 — WS2812B RGB-LED via RMT
+    led_strip_config_t strip_cfg = {};
+    strip_cfg.strip_gpio_num        = (int)FullColorLED_GPIO;
+    strip_cfg.max_leds              = 1;
+    strip_cfg.led_model             = LED_MODEL_WS2812;
+    strip_cfg.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+    led_strip_rmt_config_t rmt_cfg = {};
+    rmt_cfg.resolution_hz = 10 * 1000 * 1000;  // 10 MHz
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &_rgb_strip));
+    led_strip_clear(_rgb_strip);
+}
 
-    // Initialise LCD (SDA=GPIO05, SCL=GPIO06, address=0x27)
-    lcd.init(GPIO_NUM_5, GPIO_NUM_6, 0x27);  // clears display internally
-    lcd.setCursor(0, 0);
-    lcd.print("                ");  // pre-clear row 0
-    lcd.setCursor(0, 1);
-    lcd.print("                ");  // pre-clear row 1
-    lcd.setCursor(0, 0);
-    lcd.print("  RoboMAZ Ready!");
+// ── Compass direction helper ─────────────────────────────────────
+static const char* compassDir(float deg)
+{
+    static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+    return dirs[(int)((deg + 22.5f) / 45.0f) % 8];
+}
 
-    // GY-271 and MPU-6050 join the same I2C bus the LCD already created
-    compass.init(lcd.busHandle());
-    imu.init(lcd.busHandle());
+// ── Speed helper — clamp to [0,100] ──────────────────────────────
+static float parseSpeed(const char* s)
+{
+    float v = (float)atof(s);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 100.0f) v = 100.0f;
+    return v;
+}
 
-    robot.begin();
+// ================================================================
+//  BT command handler  (runs on control_task via bt.update())
+// ================================================================
+static bool handleBtCommand(const ParsedCommand& cmd)
+{
+    auto& bt = btCommInstance();
 
-    delay_ms(1000); // settle: let power rails stabilise
-
-    //motors_demo();
-   
-
-    robot.coast();
-    ESP_LOGI(TAG, "--- Demo complete. Idle.");
-
-    auto compassDir = [](float deg) -> const char* {
-        static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
-        return dirs[(int)((deg + 22.5f) / 45.0f) % 8];
+    auto moveCmd = [&](const char* name, auto fn, MotorState state) -> bool {
+        float spd = (cmd.nParams >= 1) ? parseSpeed(cmd.params[0]) : g_defaultSpeed;
+        (robot.*fn)(spd);
+        g_motorState = state;
+        bt.sendAck(name);
+        return true;
     };
 
-    while (true)
-    {
+    if (strcmp(cmd.cmd, "FWD") == 0)
+        return moveCmd("FWD",  &MecanumRobot::moveForward,              MotorState::FWD);
+    if (strcmp(cmd.cmd, "BWD") == 0)
+        return moveCmd("BWD",  &MecanumRobot::moveBackward,             MotorState::BWD);
+    if (strcmp(cmd.cmd, "SL") == 0)
+        return moveCmd("SL",   &MecanumRobot::strafeLeft,               MotorState::SL);
+    if (strcmp(cmd.cmd, "SR") == 0)
+        return moveCmd("SR",   &MecanumRobot::strafeRight,              MotorState::SR);
+    if (strcmp(cmd.cmd, "RCW") == 0)
+        return moveCmd("RCW",  &MecanumRobot::rotateClockwise,          MotorState::RCW);
+    if (strcmp(cmd.cmd, "RCCW") == 0)
+        return moveCmd("RCCW", &MecanumRobot::rotateCounterClockwise,   MotorState::RCCW);
+    if (strcmp(cmd.cmd, "DFL") == 0)
+        return moveCmd("DFL",  &MecanumRobot::moveDiagonalFrontLeft,    MotorState::DFL);
+    if (strcmp(cmd.cmd, "DFR") == 0)
+        return moveCmd("DFR",  &MecanumRobot::moveDiagonalFrontRight,   MotorState::DFR);
+    if (strcmp(cmd.cmd, "DRL") == 0)
+        return moveCmd("DRL",  &MecanumRobot::moveDiagonalRearLeft,     MotorState::DRL);
+    if (strcmp(cmd.cmd, "DRR") == 0)
+        return moveCmd("DRR",  &MecanumRobot::moveDiagonalRearRight,    MotorState::DRR);
+
+    if (strcmp(cmd.cmd, "R360CW") == 0)
+        return moveCmd("R360CW",  &MecanumRobot::rotateClockwise,       MotorState::RCW);
+    if (strcmp(cmd.cmd, "R360CCW") == 0)
+        return moveCmd("R360CCW", &MecanumRobot::rotateCounterClockwise, MotorState::RCCW);
+
+    if (strcmp(cmd.cmd, "BRK") == 0 || strcmp(cmd.cmd, "STOP") == 0) {
+        robot.brake();
+        g_motorState = MotorState::BRK;
+        bt.sendAck("BRK");
+        return true;
+    }
+    if (strcmp(cmd.cmd, "CST") == 0) {
+        robot.coast();
+        g_motorState = MotorState::CST;
+        bt.sendAck("CST");
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "SPD") == 0) {
+        if (cmd.nParams < 1) { bt.sendError("BAD_PARAM:SPD"); return true; }
+        g_defaultSpeed = parseSpeed(cmd.params[0]);
+        robot.setGlobalSpeed(g_defaultSpeed);
+        bt.sendAck("SPD");
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "LED") == 0) {
+        if (cmd.nParams < 3) { bt.sendError("BAD_PARAM:LED"); return true; }
+        uint8_t r = (uint8_t)atoi(cmd.params[0]);
+        uint8_t g = (uint8_t)atoi(cmd.params[1]);
+        uint8_t b = (uint8_t)atoi(cmd.params[2]);
+        g_ledManualHold = true;
+        setRGB(r, g, b);
+        bt.sendAck("LED");
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "LCD") == 0) {
+        if (cmd.nParams < 2) { bt.sendError("BAD_PARAM:LCD"); return true; }
+        uint8_t row = (uint8_t)atoi(cmd.params[0]);
+        if (row > 1) { bt.sendError("BAD_PARAM:LCD"); return true; }
+        lcdRow(row, "%s", cmd.params[1]);
+        bt.sendAck("LCD");
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "TEL") == 0) {
+        bt.sendLine("TEL:CPUTEMP:0.0");
+
         float heading = 0.0f;
         if (compass.read(heading) == ESP_OK)
-            lcdRow(0, "Hdg:%5.1f %s", heading, compassDir(heading));
+            bt.sendLine("TEL:HDG:%.1f:%s", heading, compassDir(heading));
         else
-            lcdRow(0, "Hdg: ---");
+            bt.sendLine("TEL:HDG:0.0:N");
 
         float pitch = 0.0f, roll = 0.0f;
         if (imu.readAngles(pitch, roll) == ESP_OK) {
-            mpuDriveRobot(pitch, roll);
-            lcdRow(1, "P:%4d  R:%4d", (int)pitch, (int)roll);
+            bt.sendLine("TEL:PITCH:%.1f", pitch);
+            bt.sendLine("TEL:ROLL:%.1f", roll);
         } else {
-            robot.coast();
-            lcdRow(1, "IMU error");
+            bt.sendLine("TEL:PITCH:0.0");
+            bt.sendLine("TEL:ROLL:0.0");
         }
 
-        delay_ms(100);
+        bt.sendLine("TEL:GPS:0.0:0.0");
+        bt.sendLine("TEL:MOTOR:%s", motorStateStr(g_motorState));
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "PING") == 0) {
+        bt.sendPong();
+        return true;
+    }
+
+    if (strcmp(cmd.cmd, "INFO") == 0) {
+        bt.sendLine("TEL:INFO:FW:1.1.0-BLE-RTOS");
+        return true;
+    }
+
+    return false;
+}
+
+// ================================================================
+//  BT disconnect safety handler  (runs on control_task)
+// ================================================================
+static void handleBtDisconnect()
+{
+    ESP_LOGW(TAG, "BT disconnect — braking motors, LED red");
+    robot.brake();
+    g_motorState    = MotorState::BRK;
+    g_ledAutoCycle  = false;
+    g_ledManualHold = false;
+    setRGB(255, 0, 0);
+    lcdRow(1, "BT Disconnected");
+}
+
+// ================================================================
+//  control_task — BT polling, LED cycling, connection state
+//  50 Hz (20 ms period), pinned to core 1, priority 5
+//
+//  Owns: BT command dispatch, motor state, LED cycling, LCD row 1
+//        when BT is connected.
+// ================================================================
+static void control_task(void * /*arg*/)
+{
+    auto& bt = btCommInstance();
+    bool wasBtConnected = false;
+
+    ESP_LOGI(TAG, "control_task started");
+
+    while (true)
+    {
+        bt.update();
+
+        bool nowConnected = bt.isConnected();
+
+        // ── Connection state change ──────────────────────────────
+        if (nowConnected && !wasBtConnected) {
+            g_ledAutoCycle   = true;
+            g_ledManualHold  = false;
+            g_ledColorIndex  = 0;
+            g_ledLastCycleMs = millis();
+            g_motorState     = MotorState::IDLE;
+            g_btConnected.store(true, std::memory_order_release);
+            lcdRow(1, "BT: Connected!");
+            ESP_LOGI(TAG, "BT connected — LED cycling started");
+        }
+        else if (!nowConnected && wasBtConnected) {
+            g_btConnected.store(false, std::memory_order_release);
+        }
+        wasBtConnected = nowConnected;
+
+        // ── LED ──────────────────────────────────────────────────
+        if (nowConnected) {
+            updateLedCycle();
+        } else {
+            setRGB(255, 0, 0);  // solid red = disconnected
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz
     }
 }
 
 // ================================================================
-//  mpuDriveRobot()
-//  Translates MPU-6050 pitch/roll angles into robot movement.
-//    Pitch < 0 (nose down) → forward
-//    Pitch > 0 (nose up)   → backward
-//    Roll  > 0 (right)     → strafe right
-//    Roll  < 0 (left)      → strafe left
-//    Dominant axis wins. Speed is proportional to tilt (70–100 %).
+//  sensor_task — compass / IMU reads, LCD update when BT is off
+//  10 Hz (100 ms period), pinned to core 1, priority 3
+//
+//  Owns: I2C sensor reads (compass, IMU), LCD rows 0 and 1 when
+//        BT is NOT connected.  When BT is active, control_task
+//        owns the LCD — sensor_task skips writes.
 // ================================================================
-static void mpuDriveRobot(float pitch, float roll)
+static void sensor_task(void * /*arg*/)
 {
-    constexpr float DEADBAND = 8.0f;
-    constexpr float MAX_TILT = 40.0f;
+    ESP_LOGI(TAG, "sensor_task started");
 
-    auto tiltSpeed = [](float tilt) -> float {
-        return 60.0f; // (tilt - DEADBAND) / (MAX_TILT - DEADBAND) * 30.0f + 60.0f when re-enabling proportional speed
-    };
+    while (true)
+    {
+        bool btOn = g_btConnected.load(std::memory_order_acquire);
 
-    const bool pitchActive   = fabsf(pitch) > DEADBAND;
-    const bool rollActive    = fabsf(roll)  > DEADBAND;
-    const bool pitchDominant = fabsf(pitch) >= fabsf(roll);
+        float heading = 0.0f;
+        compass.read(heading);
 
-    if (pitchActive && pitchDominant) {
-        if (pitch < 0)  robot.moveForward(tiltSpeed(-pitch));
-        else            robot.moveBackward(tiltSpeed(pitch));
-    } else if (rollActive) {
-        if (roll > 0)   robot.strafeLeft(tiltSpeed(roll));
-        else            robot.strafeRight(tiltSpeed(-roll));
-    } else {
-        robot.coast();
+        float pitch = 0.0f, roll = 0.0f;
+        imu.readAngles(pitch, roll);
+
+        // Update LCD only when BT is NOT connected
+        if (!btOn) {
+            lcdRow(0, "Hdg:%5.1f %s", heading, compassDir(heading));
+            lcdRow(1, "P:%4d  R:%4d", (int)pitch, (int)roll);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));  // 10 Hz
     }
+}
+
+// ================================================================
+//  app_main — init hardware, create tasks, delete self
+// ================================================================
+//
+// xTaskCreatePinnedToCore signature for reference:
+//   xTaskCreatePinnedToCore(pvTaskCode, pcName, usStackDepth,
+//                           pvParameters, uxPriority, pxCreatedTask, xCoreID)
+//
+// Core assignment:
+//   Core 0 — reserved for NimBLE host task (created by nimble_port_freertos_init)
+//   Core 1 — application tasks (control, sensor)
+//
+// Stack sizes:
+//   control → 8 192 B — BT update, command dispatch, LED refresh, motor calls
+//   sensor  → 4 096 B — I2C reads (compass + IMU), LCD writes
+//   To measure actual usage: uxTaskGetStackHighWaterMark(h_control)
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "================================");
+    ESP_LOGI(TAG, "   Hello Robo MAZ! Starting up  ");
+    ESP_LOGI(TAG, "   FreeRTOS multi-task mode      ");
+    ESP_LOGI(TAG, "================================");
+
+    // ── LED init ─────────────────────────────────────────────────
+    init_led();
+    setRGB(255, 0, 0);  // solid red until BLE connects
+
+    // ── LCD init (SDA=GPIO05, SCL=GPIO06, address=0x27) ─────────
+    lcd.init(GPIO_NUM_5, GPIO_NUM_6, 0x27);
+    lcd.setCursor(0, 0);
+    lcd.print("                ");
+    lcd.setCursor(0, 1);
+    lcd.print("                ");
+    lcd.setCursor(0, 0);
+    lcd.print("  RoboMAZ Ready!");
+
+    // ── I2C sensors (share the bus the LCD already created) ──────
+    compass.init(lcd.busHandle());
+    imu.init(lcd.busHandle());
+
+    // ── Motors ───────────────────────────────────────────────────
+    robot.begin();
+    vTaskDelay(pdMS_TO_TICKS(500));  // let power rails settle
+    robot.coast();
+    ESP_LOGI(TAG, "Hardware init complete.");
+
+    // ── NVS init (required by NimBLE for bonding + RF calibration) ─
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // ── BLE init ─────────────────────────────────────────────────
+    // NimBLE host task is created internally on core 0
+    auto& bt = btCommInstance();
+    bt.begin("RoboMAZ-Explorer");
+    bt.onCommand(handleBtCommand);
+    bt.onDisconnect(handleBtDisconnect);
+
+    lcdRow(1, "BT: Advertising");
+    ESP_LOGI(TAG, "BLE initialised — creating RTOS tasks");
+
+    // ── Create tasks — pinned to core 1 (core 0 = NimBLE) ───────
+    xTaskCreatePinnedToCore(control_task, "control", 8192, nullptr, 5, &h_control, 1);
+    xTaskCreatePinnedToCore(sensor_task,  "sensor",  4096, nullptr, 3, &h_sensor,  1);
+
+    ESP_LOGI(TAG, "Tasks created — deleting app_main task");
+
+    // Delete app_main's own task — frees its stack (~4 KB).
+    // The application tasks are now fully owned by the FreeRTOS scheduler.
+    vTaskDelete(nullptr);
 }

@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "Bluetooth/BluetoothComm.cpp"
         "Motor/MecanumRobot.cpp"
         "PWM/MAZPWM.cpp"
         "LCD/MAZLCD.cpp"
@@ -13,6 +14,8 @@ idf_component_register(
         esp_driver_mcpwm  # driver/mcpwm_*.h — IDF MCPWM driver
         esp_driver_i2c    # driver/i2c_master.h — I2C for LCD
         led_strip         # WS2812B on GPIO48 via RMT
+        bt                # Bluetooth (NimBLE)
+        nvs_flash         # NVS — required by NimBLE for bonding + RF cal
         freertos
         log
 )
